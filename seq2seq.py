@@ -2,7 +2,10 @@ import spacy
 import torch
 import torch.nn as nn
 from torch.optim import Adam
+
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
 
 from torchtext.datasets import Multi30k
 from torchtext.data import Field, BucketIterator
@@ -155,7 +158,9 @@ class Seq2Seq(pl.LightningModule):
 
         outputs = self(src, trg).to(self.device)
 
+        # Ignore <sos> token
         loss = self.loss_fn(outputs[1:].view(-1, outputs.shape[2]), trg[1:].view(-1))
+        self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -164,7 +169,9 @@ class Seq2Seq(pl.LightningModule):
 
         outputs = self(src, trg, tearcher_forcing_ratio=0.).to(self.device)
 
+        # Ignore <sos> token
         loss = self.loss_fn(outputs[1:].view(-1, outputs.shape[2]), trg[1:].view(-1))
+        self.log("val_loss", loss)
         return loss
         
 
@@ -224,10 +231,10 @@ if __name__ == "__main__":
     #-------------------------------------------------------------------------------------
     SRC_VOCAB_SIZE = len(SRC.vocab)
     TRG_VOCAB_SIZE = len(TRG.vocab)
-    ENC_EMB_DIM = 256
-    DEC_EMB_DIM = 256
-    ENC_HID_DIM = 512
-    DEC_HID_DIM = 512
+    ENC_EMB_DIM = 128
+    DEC_EMB_DIM = 128
+    ENC_HID_DIM = 256
+    DEC_HID_DIM = 256
     ENC_DROPOUT = 0.5
     DEC_DROPOUT = 0.5
 
@@ -239,11 +246,12 @@ if __name__ == "__main__":
 
     # Training
     #-------------------------------------------------------------------------------------
+    checkpoint = ModelCheckpoint(monitor='val_loss')
+    logger = TensorBoardLogger(save_dir=r".\logs")
     trainer = pl.Trainer(gpus=1,
-                         gradient_clip_val=1.)
+                         gradient_clip_val=1.,
+                         callbacks=[checkpoint],
+                         logger=logger)
+
+    
     trainer.fit(model, train_iterator, valid_iterator)
-
-
-                # # trainer.fit(model, 
-                # # train_dataloader=train_iterator,
-                # # val_dataloaders=valid_iterator)
