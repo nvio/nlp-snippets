@@ -1,7 +1,9 @@
+from os import stat
 import spacy
 import torch
 import torch.nn as nn
 from torch.optim import Adam
+import numpy as np
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
@@ -28,7 +30,7 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.dim_model = dim_model
         self.dim_head = dim_model // n_heads
-        self.scale = torch.sqrt(self.dim_head)
+        self.scale = np.sqrt(self.dim_head)
 
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, mask=None):
@@ -50,7 +52,7 @@ class MultiHeadAttention(nn.Module):
         query, key, value = self.split_parallel_heads_input(query, key, value)
 
         similarity = torch.matmul(query, key.permute(0, 1, 3, 2)) / self.scale           #  (bath_size, n_heads, query_len, key_len)
-        if mask:
+        if mask is not None:
             similarity.masked_fill_(mask == 0, -10e12)
         attention_weights = self.dropout(torch.softmax(similarity, dim=3))               #  (bath_size, n_heads, query_len, key_len)
 
@@ -97,7 +99,7 @@ class MultiHeadAttention(nn.Module):
         batch_size = output.shape[0]
         query_len = output.shape[2]
         output = output.permute(0, 2, 1, 3)
-        return output.view(batch_size, query_len, self.dim_model)
+        return output.reshape(batch_size, query_len, self.dim_model)
 
 class FeedForward(nn.Module):
     """Position-Wise Feed Forward block. 
@@ -127,7 +129,7 @@ class EncoderLayer(nn.Module):
         self.self_attention = MultiHeadAttention(dim_model, n_heads, dropout)
         self.layer_norm1 = nn.LayerNorm(dim_model)
         self.feed_forward = FeedForward(dim_model, dim_ff, dropout)
-        self.layer_norm2 = nn.LayerNorm(dim_ff)
+        self.layer_norm2 = nn.LayerNorm(dim_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, input, mask=None):
@@ -156,6 +158,7 @@ class Encoder(nn.Module):
         self.layers = nn.ModuleList([EncoderLayer(dim_model, n_heads, dim_ff, dropout) 
                                     for _ in range(n_layers)])
 
+
     def forward(self, src: torch.Tensor, mask=None):
         """
         Args:
@@ -176,7 +179,7 @@ class Encoder(nn.Module):
 
     def get_positions(self, seq):
         batch_size, seq_len = seq.shape[:2]
-        return torch.arange(0, seq_len).unsqueeze(0).repeat(batch_size, 1).to(self.device)
+        return torch.arange(0, seq_len).unsqueeze(0).repeat(batch_size, 1).to(seq.device)
 
 
 class DecoderLayer(nn.Module):
@@ -186,7 +189,7 @@ class DecoderLayer(nn.Module):
         self.layer_norm1 = nn.LayerNorm(dim_model)
         self.encoder_attention = MultiHeadAttention(dim_model, n_heads, dropout)
         self.layer_norm2 = nn.LayerNorm(dim_model)
-        self.feed_forward = FeedForward(dim_model, dim_ff)
+        self.feed_forward = FeedForward(dim_model, dim_ff, dropout)
         self.layer_norm3 = nn.LayerNorm(dim_model)
 
     def forward(self, encoded_src, input, trg_mask=None, src_mask=None):
@@ -213,10 +216,10 @@ class DecoderLayer(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, trg_vocab_size, embedding_size, max_sequence_len, n_layers, dim_model, n_heads, dim_ff, dropout):
+    def __init__(self, trg_vocab_size, max_sequence_len, n_layers, dim_model, n_heads, dim_ff, dropout):
         super().__init__()
-        self.token_embedding = nn.Embedding(trg_vocab_size, embedding_size)
-        self.positional_embedding = nn.Embedding(max_sequence_len, embedding_size)
+        self.token_embedding = nn.Embedding(trg_vocab_size, dim_model)
+        self.positional_embedding = nn.Embedding(max_sequence_len, dim_model)
         self.layers = nn.ModuleList([DecoderLayer(dim_model, n_heads, dim_ff, dropout) 
                                     for _ in range(n_layers)])
         self.linear = nn.Linear(dim_model, trg_vocab_size)
@@ -245,7 +248,7 @@ class Decoder(nn.Module):
 
     def get_positions(self, seq):
         batch_size, seq_len = seq.shape[:2]
-        return torch.arange(0, seq_len).unsqueeze(0).repeat(batch_size, 1).to(self.device)
+        return torch.arange(0, seq_len).unsqueeze(0).repeat(batch_size, 1).to(seq.device)
 
 
 class Transformer(pl.LightningModule):
@@ -254,24 +257,67 @@ class Transformer(pl.LightningModule):
         self.encoder = encoder
         self.decoder = decoder
 
-        TRG_PAD_IDX = TRG.vocab.stoi[TRG.pad_token]
-        self.loss_fn = nn.CrossEntropyLoss(ignore_index = TRG_PAD_IDX)
+        self.pad_token_idx = 1
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=self.pad_token_idx)
 
     def forward(self, src, trg):
-        encoded_src = self.encoder(src)
+        #trg_mask, src_mask
+        src_mask = self.create_pad_mask(src)
+        trg_mask = self.create_pad_mask(trg) & self.create_casual_mask(trg)
+        encoded_src = self.encoder(src, src_mask)
         probabilities = self.decoder(trg, encoded_src, trg_mask, src_mask)
         return probabilities
+
+    def create_pad_mask(self, seq):
+        return (seq != self.pad_token_idx).unsqueeze(1).unsqueeze(2)
+
+    def create_casual_mask(self, seq):
+        seq_len = seq.shape[1]
+        return torch.tril(torch.ones(seq_len, seq_len)).bool().to(seq.device)
+
 
     def training_step(self, batch, batch_idx):
         src = batch.src
         trg = batch.trg
 
-        probabilities = self(src, trg)
+        probabilities = self(src, self.remove_eos(trg))
 
-        # TODO: ponerlo bien
+        probabilities = probabilities.reshape(-1, probabilities.shape[-1])
+        trg = self.remove_sos(trg).reshape(-1)
+
         loss = self.loss_fn(probabilities, trg)
         self.log("train_loss", loss)
         return loss
+
+
+    def validation_step(self, batch, batch_idx):
+        src = batch.src
+        trg = batch.trg
+
+        probabilities = self(src, self.remove_eos(trg))
+
+        probabilities = probabilities.reshape(-1, probabilities.shape[-1])
+        trg = self.remove_sos(trg).reshape(-1)
+
+        loss = self.loss_fn(probabilities, trg)
+        self.log("val_loss", loss)
+        return loss
+
+
+    @staticmethod
+    def remove_eos(seq):
+        """
+        Args:
+            seq (torch.Tensor): Removes <eos> (last token if seq is not padded).
+                                If seq is padded then the model will try to predict something after the <eos>. However,
+                                we do not compute the loss in this case, because the loss function ignores the predictions 
+                                corresponding to <pad>.
+        """
+        return seq[:, :-1]
+
+    @staticmethod
+    def remove_sos(seq):
+        return seq[:, 1:]
 
 
     def configure_optimizers(self):
@@ -333,6 +379,7 @@ if __name__ == "__main__":
 
     print(f"Unique tokens in source (de) vocabulary: {len(SRC.vocab)}")
     print(f"Unique tokens in target (en) vocabulary: {len(TRG.vocab)}")
+    print(f"Pad token index {TRG.pad_token} {SRC.pad_token}")
 
 
     # 4) Create Dataloaders
@@ -341,7 +388,25 @@ if __name__ == "__main__":
     train_iterator, valid_iterator, test_iterator = BucketIterator.splits((train_data, valid_data, test_data), 
                                                                            batch_size=BATCH_SIZE)
 
-    for e in train_iterator:
-        print(e.src)
+
+
+    # Model
+    #------------------------------------------------------------------------------------
+    encoder = Encoder(len(SRC.vocab), 100, 3, 512, 8, 1024, 0.1)
+    decoder = Decoder(len(TRG.vocab), 100, 3, 512, 8, 1024, 0.1)
+    model = Transformer(encoder, decoder)
+
+
+    # Training
+    #-------------------------------------------------------------------------------------
+    checkpoint = ModelCheckpoint(monitor='val_loss', save_top_k=1)
+    logger = TensorBoardLogger(save_dir=r".\logs", name="transformer")
+    trainer = pl.Trainer(gpus=1,
+                         gradient_clip_val=1.,
+                         callbacks=[checkpoint],
+                         logger=logger)
+
+    trainer.fit(model, train_iterator, valid_iterator)
+
 
 
